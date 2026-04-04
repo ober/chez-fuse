@@ -4,7 +4,10 @@
     vault-create!      ;; path passphrase total-blocks → vault
     vault-open         ;; path passphrase → vault
     vault-close!       ;; vault → void
-    vault->fuse-ops    ;; vault → ops-hashtable
+    vault-lock!        ;; vault → void (clear key, deny all I/O)
+    vault-unlock!      ;; vault passphrase → void (re-derive key)
+    vault-locked?      ;; vault → boolean
+    vault->fuse-ops    ;; vault → ops-hashtable (with access gating)
     ;; Shell integration
     vault-mount!       ;; path passphrase mountpoint . opts → (cons vault session)
     vault-unmount!)    ;; (cons vault session) → void
@@ -14,6 +17,8 @@
     (chez fuse)
     (chez fuse constants)
     (chez fuse types)
+    (chez fuse access)
+    (chez fuse secmem)
     (chez vault format)
     (chez vault crypto)
     (chez vault blockstore))
@@ -47,15 +52,18 @@
   (define-record-type vault-state
     (fields
       (mutable bs)              ;; blockstore-state
-      (mutable master-key)      ;; 32-byte bytevector (copy also in bs)
+      (mutable master-key)      ;; secure-key (mlock'd) — also set in bs
       (mutable root-block)      ;; block-num of root inode
       (mutable bitmap-start)    ;; first bitmap block number
       (mutable bitmap-nblocks)  ;; number of bitmap blocks
       (mutable generation)      ;; superblock generation counter
+      (mutable policy-block)    ;; block-num for persistent policies (or VAULT-BLOCK-INVALID)
       (mutable bitmap)          ;; flat bytevector, in-memory
       (mutable bitmap-dirty?)
       (mutable next-fh)         ;; file handle counter
       (mutable open-fhs)        ;; eq-hashtable: fh -> inode-block-num
+      (mutable access)          ;; access-controller (or #f)
+      (mutable header-bv)       ;; cached raw header (for lock/unlock re-derive)
       (mutable mutex)))
 
   ;; ======================================================================
@@ -183,7 +191,8 @@
           (vault-state-root-block vault)
           (vault-state-bitmap-start vault)
           (vault-state-bitmap-nblocks vault)
-          gen))))
+          gen
+          (vault-state-policy-block vault)))))
 
   ;; ======================================================================
   ;; File handle management
@@ -505,14 +514,18 @@
       ;; Write header
       (let ([hdr (encode-vault-header total-blocks salt KDF-ITERATIONS mk-enc sb-enc)])
         (blockstore-write-header! bs hdr))
-      ;; Set master key
+      ;; Set master key (moves into secure memory)
       (blockstore-set-key! bs master-key)
       ;; Build in-memory bitmap: mark reserved blocks as used
       (let* ([bm-bytes (* bitmap-nblks BLOCK-PAYLOAD)]
              [bm       (make-bytevector bm-bytes 0)]
              [vault    (make-vault-state
-                         bs master-key root-block bitmap-start bitmap-nblks 0
-                         bm #f 1 (make-eq-hashtable) (make-mutex))])
+                         bs #f root-block bitmap-start bitmap-nblks 0
+                         VAULT-BLOCK-INVALID  ;; policy-block
+                         bm #f 1 (make-eq-hashtable)
+                         #f       ;; access controller
+                         #f       ;; header-bv (not needed for create)
+                         (make-mutex))])
         ;; Mark blocks 0 (superblock), 1 (root inode), 2...(1+bitmap-nblks) (bitmap)
         (bitmap-set! vault 0 #t)  ;; superblock
         (bitmap-set! vault 1 #t)  ;; root inode
@@ -572,7 +585,8 @@
                 (let ([sb-pay (blockstore-read-block bs sb-block)])
                   (unless sb-pay
                     (error 'vault-open "cannot read superblock"))
-                  (let-values ([(root-block bitmap-start bitmap-nblks generation)
+                  (let-values ([(root-block bitmap-start bitmap-nblks generation
+                                 policy-block)
                                 (decode-superblock sb-pay)])
                     ;; Load bitmap into memory
                     (let* ([bm-bytes (* bitmap-nblks BLOCK-PAYLOAD)]
@@ -587,8 +601,12 @@
                       ;; Zero passphrase key
                       (bytevector-fill! pk 0)
                       (make-vault-state
-                        bs master-key root-block bitmap-start bitmap-nblks generation
-                        bm #f 1 (make-eq-hashtable) (make-mutex))))))))))))
+                        bs #f root-block bitmap-start bitmap-nblks generation
+                        policy-block
+                        bm #f 1 (make-eq-hashtable)
+                        #f       ;; access controller
+                        hdr-bv   ;; cached header for lock/unlock
+                        (make-mutex))))))))))))
 
   ;; ======================================================================
   ;; vault-close!
@@ -596,13 +614,74 @@
 
   (define (vault-close! vault)
     (with-mutex (vault-state-mutex vault)
-      (flush-superblock! vault)
-      (flush-bitmap! vault)
-      (blockstore-sync! (vault-state-bs vault))
+      (when (blockstore-key-live? (vault-state-bs vault))
+        (flush-superblock! vault)
+        (flush-bitmap! vault)
+        (blockstore-sync! (vault-state-bs vault)))
       (blockstore-clear-key! (vault-state-bs vault))
       (blockstore-close! (vault-state-bs vault))
-      (bytevector-fill! (vault-state-master-key vault) 0)
-      (vault-state-master-key-set! vault #f)))
+      (vault-state-master-key-set! vault #f)
+      (vault-state-header-bv-set! vault #f)))
+
+  ;; ======================================================================
+  ;; vault-lock! / vault-unlock!
+  ;; ======================================================================
+
+  ;; Lock: clear the master key from memory without unmounting.
+  ;; All I/O operations will fail until vault-unlock! is called.
+  ;; The FUSE mount stays alive — unauthorized processes see an empty dir.
+  (define (vault-lock! vault)
+    (with-mutex (vault-state-mutex vault)
+      ;; Flush pending state while we still have the key
+      (when (blockstore-key-live? (vault-state-bs vault))
+        (flush-superblock! vault)
+        (flush-bitmap! vault)
+        (blockstore-sync! (vault-state-bs vault)))
+      ;; Destroy the master key
+      (blockstore-clear-key! (vault-state-bs vault))
+      (vault-state-master-key-set! vault #f)
+      ;; Lock the access controller
+      (let ([ac (vault-state-access vault)])
+        (when ac (access-controller-lock! ac)))))
+
+  ;; Unlock: re-derive the master key from passphrase using cached header.
+  ;; Returns #t on success, raises on wrong passphrase.
+  (define (vault-unlock! vault passphrase)
+    (with-mutex (vault-state-mutex vault)
+      (let ([hdr-bv (vault-state-header-bv vault)])
+        (unless hdr-bv
+          (error 'vault-unlock! "no cached header — vault was not opened with vault-open"))
+        (let* ([pass-bv (if (string? passphrase) (string->utf8 passphrase) passphrase)])
+          (let-values ([(_magic _ver _blksz _total salt kdf-iter mk-enc sb-enc)
+                        (decode-vault-header hdr-bv)])
+            (let ([pk (vault-pbkdf2 pass-bv salt kdf-iter VAULT-KEY-LEN)])
+              (let ([master-key (vault-decrypt-small pk mk-enc)])
+                (bytevector-fill! pk 0)
+                (unless master-key
+                  (error 'vault-unlock! "wrong passphrase"))
+                ;; Restore the key in blockstore (moves to secure memory)
+                (blockstore-set-key! (vault-state-bs vault) master-key)
+                ;; Reload bitmap from disk (may have been modified before lock)
+                (let* ([bitmap-nblks (vault-state-bitmap-nblocks vault)]
+                       [bm-bytes (* bitmap-nblks BLOCK-PAYLOAD)]
+                       [bm (make-bytevector bm-bytes 0)]
+                       [bs (vault-state-bs vault)]
+                       [bitmap-start (vault-state-bitmap-start vault)])
+                  (let loop ([i 0])
+                    (when (< i bitmap-nblks)
+                      (let ([blk-pay (blockstore-read-block bs (+ bitmap-start i))])
+                        (when blk-pay
+                          (bytevector-copy! blk-pay 0 bm (* i BLOCK-PAYLOAD) BLOCK-PAYLOAD)))
+                      (loop (+ i 1))))
+                  (vault-state-bitmap-set! vault bm)
+                  (vault-state-bitmap-dirty?-set! vault #f))
+                ;; Unlock access controller
+                (let ([ac (vault-state-access vault)])
+                  (when ac (access-controller-unlock! ac)))
+                #t)))))))
+
+  (define (vault-locked? vault)
+    (not (blockstore-key-live? (vault-state-bs vault))))
 
   ;; ======================================================================
   ;; FUSE op implementations
@@ -879,13 +958,20 @@
 
   (define (vault-mount! path passphrase mountpoint . opts)
     ;; Open vault, mount as FUSE filesystem in background.
+    ;; Creates an access controller: only jsh (current PID) and its
+    ;; subprocesses can access the vault. Everyone else (including root)
+    ;; sees an empty directory.
     ;; Returns (cons vault session) — pass to vault-unmount!
     (let* ([vault   (vault-open path passphrase)]
-           [ops     (vault->fuse-ops vault)]
-           [session (apply fuse-start-background! ops mountpoint
-                           'fsname "vault"
-                           opts)])
-      (cons vault session)))
+           [ac      (make-access-controller)]
+           [ops     (vault->fuse-ops vault)])
+      ;; Store access controller in vault for lock/unlock
+      (vault-state-access-set! vault ac)
+      (let ([session (apply fuse-start-background! ops mountpoint
+                            'fsname "vault"
+                            'access-controller ac
+                            opts)])
+        (cons vault session))))
 
   (define (vault-unmount! handle)
     ;; handle = (cons vault session)

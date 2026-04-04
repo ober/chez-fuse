@@ -129,23 +129,28 @@
   ;;  8       8    bitmap_start      (u64 LE)
   ;; 16       8    bitmap_blocks     (u64 LE)
   ;; 24       8    generation        (u64 LE)
-  ;; 32    4036    padding
+  ;; 32       8    policy_block      (u64 LE, VAULT-BLOCK-INVALID = none)
+  ;; 40    4028    padding
 
-  (define (encode-superblock root-inode-block bitmap-start bitmap-blocks generation)
+  (define (encode-superblock root-inode-block bitmap-start bitmap-blocks
+                             generation policy-block)
     (let ([bv (make-bytevector BLOCK-PAYLOAD 0)])
       (bv-set-u64le! bv 0  root-inode-block)
       (bv-set-u64le! bv 8  bitmap-start)
       (bv-set-u64le! bv 16 bitmap-blocks)
       (bv-set-u64le! bv 24 generation)
+      (bv-set-u64le! bv 32 policy-block)
       bv))
 
   (define (decode-superblock bv)
-    ;; Returns: (values root-inode-block bitmap-start bitmap-blocks generation)
+    ;; Returns: (values root-inode-block bitmap-start bitmap-blocks
+    ;;                  generation policy-block)
     (values
       (bv-u64le bv 0)
       (bv-u64le bv 8)
       (bv-u64le bv 16)
-      (bv-u64le bv 24)))
+      (bv-u64le bv 24)
+      (bv-u64le bv 32)))
 
   ;; ---- Inode ----
   ;; Encrypted; occupies one BLOCK-PAYLOAD-byte block.

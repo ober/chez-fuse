@@ -45,14 +45,19 @@
     EPERM EBADF ENOMEM ENOSPC EROFS ENAMETOOLONG ENODATA EOPNOTSUPP ENOTSUP
     FATTR-MODE FATTR-UID FATTR-GID FATTR-SIZE FATTR-ATIME FATTR-MTIME
     FATTR-ATIME-NOW FATTR-MTIME-NOW FATTR-CTIME
-    FOPEN-DIRECT-IO FOPEN-KEEP-CACHE FOPEN-NONSEEKABLE)
+    FOPEN-DIRECT-IO FOPEN-KEEP-CACHE FOPEN-NONSEEKABLE
+
+    ;; Re-exports: Access control
+    make-access-controller access-check
+    access-controller-lock! access-controller-unlock! access-controller-locked?)
 
   (import
     (chezscheme)
     (chez fuse constants)
     (chez fuse types)
     (chez fuse codec)
-    (chez fuse mount))
+    (chez fuse mount)
+    (chez fuse access))
 
   ;; ======================================================================
   ;; FFI: low-level read/write on the /dev/fuse fd
@@ -198,6 +203,7 @@
            [allow-other? (get-option options 'allow-other #t)]
            [fd (fuse-open-device)]
            [mtx (make-mutex)]
+           [ac  (get-option options 'access-controller #f)]
            [session (make-fuse-session
                       fd mountpoint #f #f
                       FUSE-KERNEL-VERSION FUSE-KERNEL-MINOR-VERSION
@@ -205,7 +211,8 @@
                       ops
                       mtx            ;; dispatch mutex
                       #f             ;; thread handle
-                      (make-condition))]  ;; done condition
+                      (make-condition) ;; done condition
+                      ac)]            ;; access controller
            [uid (getuid)]
            [gid (getgid)])
       (fuse-mount! fd mountpoint fsname uid gid allow-other?)
@@ -259,6 +266,37 @@
   ;; Request handler — dispatches a single request
   ;; ======================================================================
 
+  ;; Opcodes that are always allowed (protocol handshake, no data exposure)
+  (define (always-allowed-opcode? op)
+    (or (= op FUSE-INIT) (= op FUSE-DESTROY)
+        (= op FUSE-INTERRUPT) (= op FUSE-STATFS)))
+
+  ;; Stealth deny: denied processes see an empty directory, not errors.
+  ;; GETATTR on root → valid empty dir attr. Everything else → ENOENT.
+  (define (stealth-deny-response opcode unique nodeid)
+    (cond
+      ;; GETATTR on root → return stealth attr so mount point looks normal
+      [(and (= opcode FUSE-GETATTR) (= nodeid FUSE-ROOT-ID))
+       (encode-attr-out unique 1 0 (stealth-deny-attr))]
+      ;; READDIR on root → return empty dir (. and .. only)
+      [(and (= opcode FUSE-READDIR) (= nodeid FUSE-ROOT-ID))
+       (encode-dirents unique (stealth-deny-readdir FUSE-ROOT-ID) 4096)]
+      ;; ACCESS on root → allow (mount point must be accessible)
+      [(and (= opcode FUSE-ACCESS) (= nodeid FUSE-ROOT-ID))
+       (encode-out-header unique 0 0)]
+      ;; OPENDIR on root → allow (so readdir works)
+      [(and (= opcode FUSE-OPENDIR) (= nodeid FUSE-ROOT-ID))
+       (encode-open-out unique 0 0)]
+      ;; RELEASEDIR → always OK
+      [(= opcode FUSE-RELEASEDIR)
+       (encode-out-header unique 0 0)]
+      ;; FORGET → no response needed
+      [(or (= opcode FUSE-FORGET) (= opcode FUSE-BATCH-FORGET)) #f]
+      ;; LOOKUP → ENOENT (nothing in the directory)
+      [(= opcode FUSE-LOOKUP) (encode-error unique ENOENT)]
+      ;; Everything else → ENOENT
+      [else (encode-error unique ENOENT)]))
+
   (define (handle-request session buf n debug?)
     (let* ([hdr (decode-in-header buf)]
            [opcode (fuse-request-opcode hdr)]
@@ -271,22 +309,34 @@
            [ops (fuse-session-ops session)]
            [fd (fuse-session-fd session)]
            [mtx (fuse-session-mutex session)]
+           [ac  (fuse-session-access session)]
            [payload-off FUSE-IN-HEADER-SIZE])
 
       (when debug?
         (printf "chez-fuse: op=~a unique=~a node=~a pid=~a\n"
                 (opcode->name opcode) unique nodeid pid))
 
+      ;; Access gate: check if caller PID is trusted
       (let ([response
-             (guard (exn
-                     [else
-                      (when debug?
-                        (printf "chez-fuse: handler error op=~a: ~a\n"
-                                opcode (exn-message exn)))
-                      (encode-error unique EIO)])
-               (with-mutex mtx
-                 (dispatch-opcode
-                   session ops opcode unique nodeid ctx buf payload-off n)))])
+             (if (and ac
+                      (not (always-allowed-opcode? opcode))
+                      (not (access-check ac pid)))
+               ;; Denied — stealth response
+               (begin
+                 (when debug?
+                   (printf "chez-fuse: DENIED pid=~a op=~a (stealth)\n"
+                           pid (opcode->name opcode)))
+                 (stealth-deny-response opcode unique nodeid))
+               ;; Allowed — normal dispatch
+               (guard (exn
+                       [else
+                        (when debug?
+                          (printf "chez-fuse: handler error op=~a: ~a\n"
+                                  opcode (exn-message exn)))
+                        (encode-error unique EIO)])
+                 (with-mutex mtx
+                   (dispatch-opcode
+                     session ops opcode unique nodeid ctx buf payload-off n))))])
         (when (and response (>= fd 0))
           (fuse-write fd response)))))
 

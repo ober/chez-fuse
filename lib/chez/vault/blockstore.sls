@@ -11,11 +11,14 @@
     blockstore-read-block    ;; block-num → BLOCK-PAYLOAD bv or #f
     blockstore-write-block!  ;; block-num payload → void
     blockstore-sync!
-    blockstore-total-blocks)
+    blockstore-total-blocks
+    blockstore-key-live?)
 
   (import (chezscheme)
           (chez vault format)
-          (chez vault crypto))
+          (chez vault crypto)
+          (chez fuse mount)     ;; ensure shared lib loaded
+          (chez fuse secmem))
 
   ;; ---- OS file I/O FFI ----
   ;; Load libc for pread, pwrite, open, close, fsync.
@@ -56,7 +59,7 @@
     (fields
       (mutable fd)
       (mutable total-blocks)
-      (mutable master-key)   ;; #f or 32-byte bytevector
+      (mutable master-key)   ;; #f or secure-key (mlock'd, outside GC heap)
       (mutable mutex)))
 
   (define (make-blockstore)
@@ -145,18 +148,30 @@
         (blockstore-state-fd-set! bs -1))))
 
   ;; ---- Key management ----
+  ;; Master key is stored in mlock'd memory outside the GC heap.
+  ;; It is never exposed as a plain bytevector at rest — only borrowed
+  ;; temporarily for crypto operations, then immediately zeroed.
 
   (define (blockstore-set-key! bs key-bv)
-    ;; Copy the 32-byte master key into the blockstore.
+    ;; Move the 32-byte master key into secure memory.
+    ;; key-bv is zeroed by make-secure-key.
+    (let ([old (blockstore-state-master-key bs)])
+      (when old (secure-key-destroy! old)))
     (let ([copy (make-bytevector VAULT-KEY-LEN 0)])
       (bytevector-copy! key-bv 0 copy 0 VAULT-KEY-LEN)
-      (blockstore-state-master-key-set! bs copy)))
+      (blockstore-state-master-key-set! bs (make-secure-key copy))))
 
   (define (blockstore-clear-key! bs)
-    ;; Zero and discard the master key.
-    (let ([k (blockstore-state-master-key bs)])
-      (when k (bytevector-fill! k 0)))
+    ;; Securely destroy the master key (zeros mlock'd memory + munmap).
+    (let ([sk (blockstore-state-master-key bs)])
+      (when (and sk (secure-key? sk) (secure-key-live? sk))
+        (secure-key-destroy! sk)))
     (blockstore-state-master-key-set! bs #f))
+
+  (define (blockstore-key-live? bs)
+    ;; Is the master key currently available?
+    (let ([sk (blockstore-state-master-key bs)])
+      (and sk (secure-key? sk) (secure-key-live? sk))))
 
   ;; ---- Header I/O (unencrypted) ----
 
@@ -169,31 +184,41 @@
     (raw-write! bs 0 bv))
 
   ;; ---- Block I/O (encrypted) ----
+  ;; The master key is borrowed from secure memory only for the duration
+  ;; of the crypto operation. The temporary bytevector is zeroed afterward.
 
   (define (blockstore-read-block bs block-num)
     ;; Returns decrypted BLOCK-PAYLOAD-byte bv, or #f on auth failure / I/O error.
     (with-mutex (blockstore-state-mutex bs)
-      (let ([mk (blockstore-state-master-key bs)])
-        (and mk
-             (let* ([raw-bv   (make-bytevector BLOCK-SIZE 0)]
-                    [offset   (block-offset block-num)])
+      (let ([sk (blockstore-state-master-key bs)])
+        (and sk (secure-key? sk) (secure-key-live? sk)
+             (let* ([raw-bv (make-bytevector BLOCK-SIZE 0)]
+                    [offset (block-offset block-num)])
                (guard (exn [#t #f])
                  (raw-read! bs offset raw-bv)
-                 (let ([bk (vault-block-key mk block-num)])
-                   (vault-decrypt-block bk raw-bv))))))))
+                 (call-with-secure-key sk
+                   (lambda (mk-bv)
+                     (let* ([bk  (vault-block-key mk-bv block-num)]
+                            [result (vault-decrypt-block bk raw-bv)])
+                       (bytevector-fill! bk 0)
+                       result)))))))))
 
   (define (blockstore-write-block! bs block-num payload-bv)
     ;; Encrypts payload and writes to disk. payload-bv must be BLOCK-PAYLOAD bytes.
     (with-mutex (blockstore-state-mutex bs)
-      (let ([mk (blockstore-state-master-key bs)])
-        (unless mk (error 'blockstore-write-block! "no master key set"))
+      (let ([sk (blockstore-state-master-key bs)])
+        (unless (and sk (secure-key? sk) (secure-key-live? sk))
+          (error 'blockstore-write-block! "no master key set"))
         (unless (= (bytevector-length payload-bv) BLOCK-PAYLOAD)
           (error 'blockstore-write-block! "wrong payload size"
                  (bytevector-length payload-bv)))
-        (let* ([bk         (vault-block-key mk block-num)]
-               [encrypted  (vault-encrypt-block bk payload-bv)]
-               [offset     (block-offset block-num)])
-          (raw-write! bs offset encrypted)))))
+        (call-with-secure-key sk
+          (lambda (mk-bv)
+            (let* ([bk        (vault-block-key mk-bv block-num)]
+                   [encrypted (vault-encrypt-block bk payload-bv)]
+                   [offset    (block-offset block-num)])
+              (bytevector-fill! bk 0)
+              (raw-write! bs offset encrypted)))))))
 
   ;; ---- Sync ----
 

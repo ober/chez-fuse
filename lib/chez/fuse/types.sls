@@ -48,7 +48,8 @@
     fuse-session-ops fuse-session-ops-set!
     fuse-session-mutex fuse-session-mutex-set!
     fuse-session-thread fuse-session-thread-set!
-    fuse-session-done fuse-session-done-set!)
+    fuse-session-done fuse-session-done-set!
+    fuse-session-access fuse-session-access-set!)
 
   (import (chezscheme))
 
@@ -141,6 +142,7 @@
       (mutable ops)           ;; hashtable of symbol -> procedure
       (mutable mutex)         ;; dispatch mutex for thread safety
       (mutable thread)        ;; background thread handle (or #f)
-      (mutable done)))        ;; completion flag
+      (mutable done)          ;; condition variable for join
+      (mutable access)))      ;; access-controller or #f (stealth deny)
 
 ) ;; end library

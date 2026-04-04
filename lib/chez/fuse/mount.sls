@@ -7,7 +7,10 @@
     fuse-get-errno
     fuse-close-device
     fuse-block-signal
-    fuse-unblock-signal)
+    fuse-unblock-signal
+
+    ;; Ensure the shared library is loaded (used by secmem, access)
+    ensure-mount-lib!)
 
   (import
     (rnrs)
@@ -29,6 +32,10 @@
               (load-shared-object "./src/libchez_fuse_mount.so"))])
             (load-shared-object "./libchez_fuse_mount.so"))
           (set! loaded #t)))))
+
+  ;; Public: ensure the shared lib is loaded (called by secmem, access modules)
+  (define (ensure-mount-lib!)
+    (mount-lib-loaded?))
 
   ;; FFI bindings
   (define c-open-device #f)

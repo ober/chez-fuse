@@ -3,6 +3,7 @@
 
 (import (chezscheme))
 (import (chez vault))
+(import (chez fuse access))
 
 (define pass 0)
 (define fail 0)
@@ -62,6 +63,27 @@
       (vault-close! v))
     (loop (+ i 1))))
 (test-assert "repeated open/close OK" #t)
+
+;; Test: Lock/unlock
+(display "=== vault lock/unlock ===") (newline)
+(define v-lock (vault-open test-path "secret123"))
+(test-assert "vault is not locked initially" (not (vault-locked? v-lock)))
+
+(vault-lock! v-lock)
+(test-assert "vault is locked after lock!" (vault-locked? v-lock))
+
+(vault-unlock! v-lock "secret123")
+(test-assert "vault is not locked after unlock!" (not (vault-locked? v-lock)))
+
+;; Wrong passphrase on unlock
+(vault-lock! v-lock)
+(define wrong-unlock
+  (guard (exn [#t #t])
+    (vault-unlock! v-lock "wrongpassword")
+    #f))
+(test-assert "wrong passphrase on unlock rejected" wrong-unlock)
+
+(vault-close! v-lock)
 
 (display "=== vault file size ===") (newline)
 

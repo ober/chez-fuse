@@ -1,14 +1,26 @@
 /*
- * chez-fuse mount helper — tiny C shim for platform-specific mount/unmount.
+ * chez-fuse mount helper — C shim for platform-specific operations.
  * Compiled as a shared library, loaded by Chez Scheme via load-shared-object.
  *
  * Exports:
- *   int chez_fuse_open_device(void)
- *   int chez_fuse_mount(int fd, const char *mountpoint, const char *fsname,
- *                       int uid, int gid, int allow_other)
- *   int chez_fuse_unmount(const char *mountpoint)
- *   int chez_fuse_unmount_lazy(const char *mountpoint)
- *   int chez_fuse_get_errno(void)
+ *   Mount/unmount:
+ *     int chez_fuse_open_device(void)
+ *     int chez_fuse_mount(int fd, const char *mountpoint, const char *fsname,
+ *                         int uid, int gid, int allow_other)
+ *     int chez_fuse_unmount(const char *mountpoint)
+ *     int chez_fuse_unmount_lazy(const char *mountpoint)
+ *     int chez_fuse_get_errno(void)
+ *
+ *   Secure memory (mlock'd, excluded from core dumps):
+ *     void *chez_fuse_secmem_alloc(size_t size)
+ *     void  chez_fuse_secmem_free(void *ptr, size_t size)
+ *     void  chez_fuse_secmem_copy_in(void *dst, const uint8_t *src, size_t len)
+ *     void  chez_fuse_secmem_copy_out(uint8_t *dst, const void *src, size_t len)
+ *     void  chez_fuse_secmem_zero(void *ptr, size_t size)
+ *
+ *   Process tree inspection:
+ *     int   chez_fuse_getpid(void)
+ *     int   chez_fuse_getppid_of(int pid)
  */
 
 #include <errno.h>
@@ -18,20 +30,138 @@
 #include <string.h>
 #include <unistd.h>
 #include <signal.h>
+#include <sys/mman.h>
 #include <sys/wait.h>
 
 #if defined(FREEBSD)
 #include <sys/param.h>
 #include <sys/mount.h>
 #include <sys/uio.h>
+#include <sys/types.h>
+#include <sys/sysctl.h>
+#include <sys/user.h>
 #elif defined(LINUX)
 #include <sys/mount.h>
+#include <sys/prctl.h>
 #ifndef MNT_DETACH
 #define MNT_DETACH 2
 #endif
 #elif defined(DARWIN)
-/* macOS uses FUSE-T or macFUSE — needs separate handling */
+#include <libproc.h>
+#include <sys/proc_info.h>
 #endif
+
+/* ====================================================================
+ * Secure memory — mlock'd, core-dump excluded, volatile-zeroed on free
+ * ==================================================================== */
+
+void *chez_fuse_secmem_alloc(size_t size) {
+    /* Use mmap for page-aligned allocation we fully control */
+    void *p = mmap(NULL, size, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) return NULL;
+
+    /* Lock into RAM — prevent swapping */
+    mlock(p, size);  /* best-effort; may fail without RLIMIT_MEMLOCK */
+
+    /* Exclude from core dumps */
+#if defined(FREEBSD)
+    madvise(p, size, MADV_NOCORE);
+#elif defined(LINUX)
+    madvise(p, size, MADV_DONTDUMP);
+#endif
+
+    memset(p, 0, size);
+    return p;
+}
+
+void chez_fuse_secmem_free(void *ptr, size_t size) {
+    if (!ptr) return;
+    /* Volatile-safe zeroing — compiler cannot optimize this away */
+    volatile unsigned char *vp = (volatile unsigned char *)ptr;
+    for (size_t i = 0; i < size; i++) vp[i] = 0;
+    munlock(ptr, size);
+    munmap(ptr, size);
+}
+
+void chez_fuse_secmem_zero(void *ptr, size_t size) {
+    if (!ptr) return;
+    volatile unsigned char *vp = (volatile unsigned char *)ptr;
+    for (size_t i = 0; i < size; i++) vp[i] = 0;
+}
+
+void chez_fuse_secmem_copy_in(void *dst, const unsigned char *src, size_t len) {
+    memcpy(dst, src, len);
+}
+
+void chez_fuse_secmem_copy_out(unsigned char *dst, const void *src, size_t len) {
+    memcpy(dst, src, len);
+}
+
+/* ====================================================================
+ * Process tree inspection
+ * ==================================================================== */
+
+int chez_fuse_getpid(void) {
+    return (int)getpid();
+}
+
+#if defined(FREEBSD)
+
+/* Get parent PID of any process via sysctl. Returns -1 on error. */
+int chez_fuse_getppid_of(int pid) {
+    struct kinfo_proc kp;
+    size_t len = sizeof(kp);
+    int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PID, pid };
+    if (sysctl(mib, 4, &kp, &len, NULL, 0) < 0) return -1;
+    if (len == 0) return -1;  /* process doesn't exist */
+    return (int)kp.ki_ppid;
+}
+
+#elif defined(LINUX)
+
+/* Get parent PID by reading /proc/<pid>/stat. Returns -1 on error. */
+int chez_fuse_getppid_of(int pid) {
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/stat", pid);
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    /* Format: pid (comm) state ppid ... */
+    /* comm can contain spaces and parens, so find last ')' first */
+    char buf[512];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    if (n == 0) return -1;
+    buf[n] = '\0';
+    char *p = strrchr(buf, ')');
+    if (!p) return -1;
+    int ppid = -1;
+    /* After ')' comes: space, state char, space, ppid */
+    if (sscanf(p + 2, "%*c %d", &ppid) != 1) return -1;
+    return ppid;
+}
+
+#elif defined(DARWIN)
+
+int chez_fuse_getppid_of(int pid) {
+    struct proc_bsdinfo info;
+    int ret = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, sizeof(info));
+    if (ret <= 0) return -1;
+    return (int)info.pbi_ppid;
+}
+
+#else
+
+int chez_fuse_getppid_of(int pid) {
+    (void)pid;
+    return -1;
+}
+
+#endif
+
+/* ====================================================================
+ * FUSE device and errno
+ * ==================================================================== */
 
 /* Open /dev/fuse and return the file descriptor, or -1 on error.
  * Sets O_CLOEXEC so forked children don't inherit the fd. */
@@ -60,6 +190,10 @@ int chez_fuse_unblock_signal(int signum) {
     sigaddset(&set, signum);
     return sigprocmask(SIG_UNBLOCK, &set, NULL);
 }
+
+/* ====================================================================
+ * Platform-specific mount/unmount
+ * ==================================================================== */
 
 #if defined(FREEBSD)
 
