@@ -20,7 +20,7 @@ MOUNT_FLAGS =
 
 MOUNT_HELPER = src/libchez_fuse_mount${SOEXT}
 
-.PHONY: all clean test mount umount
+.PHONY: all clean test vault-test mount umount
 
 all: ${MOUNT_HELPER}
 
@@ -34,6 +34,9 @@ clean:
 
 test: all
 	${SCHEME} --libdirs ${LIBDIRS} --script tests/test-memfs.ss
+
+vault-test: all
+	${SCHEME} --libdirs ${LIBDIRS} --script tests/test-vault.ss
 
 mount: all
 	@test -n "${MOUNTPOINT}" || (echo "MOUNTPOINT required: make mount MOUNTPOINT=/tmp/hello" && exit 1)
