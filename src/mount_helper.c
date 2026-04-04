@@ -18,6 +18,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <signal.h>
+#include <sys/wait.h>
 
 #if defined(FREEBSD)
 #include <sys/param.h>
@@ -156,9 +157,18 @@ int chez_fuse_mount(int fd, const char *mountpoint, const char *fsname,
 }
 
 int chez_fuse_unmount(const char *mountpoint) {
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "umount '%s' 2>/dev/null", mountpoint);
-    return system(cmd);
+    pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        /* Child: exec umount directly — no shell, no injection */
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) { dup2(devnull, STDERR_FILENO); close(devnull); }
+        execl("/sbin/umount", "umount", mountpoint, (char *)NULL);
+        _exit(127);
+    }
+    int status;
+    waitpid(pid, &status, 0);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 
 int chez_fuse_unmount_lazy(const char *mountpoint) {

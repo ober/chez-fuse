@@ -86,15 +86,23 @@
           [(and (< n 0) (= (fuse-get-errno) EINTR)) (loop)]
           [else n]))))
 
-  ;; Write the full bytevector. Retry on EINTR.
+  ;; Write the full bytevector. Retry on EINTR, advance on partial writes.
+  ;; We need a temporary buffer for offset writes since c-write always starts
+  ;; from byte 0 of the bytevector. For partial writes we copy the remainder.
   (define (fuse-write fd bv)
     (let ([len (bytevector-length bv)])
-      (let loop ([written 0])
+      (let loop ([written 0] [buf bv] [remaining len])
         (if (>= written len) written
-          (let ([n (c-write fd bv len)])
+          (let ([n (c-write fd buf remaining)])
             (cond
-              [(> n 0) (loop (+ written n))]
-              [(and (< n 0) (= (fuse-get-errno) EINTR)) (loop written)]
+              [(= n remaining) (+ written n)]  ;; done
+              [(> n 0)
+               ;; Partial write — make a new bytevector for the remainder
+               (let* ([left (- remaining n)]
+                      [rest (make-bytevector left)])
+                 (bytevector-copy! buf n rest 0 left)
+                 (loop (+ written n) rest left))]
+              [(and (< n 0) (= (fuse-get-errno) EINTR)) (loop written buf remaining)]
               [else written]))))))
 
   ;; ======================================================================
@@ -155,10 +163,9 @@
       (fuse-close-device (fuse-session-fd session))
       (fuse-session-fd-set! session -1))
     ;; Wait for background thread if any
-    (let ([t (fuse-session-thread session)])
-      (when t
-        (guard (exn [else (void)])
-          (scheme-thread-join t))))
+    (when (fuse-session-thread session)
+      (guard (exn [else (void)])
+        (scheme-thread-join-session session)))
     ;; Unmount
     (when (fuse-session-mounted? session)
       (guard (exn [else (void)])
@@ -167,48 +174,38 @@
 
   ;; Wait for a background session to finish (blocks until loop exits).
   (define (fuse-session-wait session)
-    (let ([t (fuse-session-thread session)])
-      (when t
-        (scheme-thread-join t))))
+    (when (fuse-session-thread session)
+      (scheme-thread-join-session session)))
 
   ;; ======================================================================
   ;; Internal: session creation and teardown
   ;; ======================================================================
 
-  ;; Portable thread join that works for Chez's thread handles.
-  (define (scheme-thread-join t)
-    ;; Chez doesn't have thread-join; busy-wait with yield.
-    ;; The thread sets running? to #f when done.
-    ;; We could use a condition variable, but keep it simple.
-    (let loop ()
-      (when (not (thread-dead? t))
-        (thread-yield)
-        (loop))))
-
-  ;; Check if a thread is dead (Chez-specific).
-  (define (thread-dead? t)
-    ;; In Chez, there's no direct "is this thread dead?" API.
-    ;; We use a mutex + condition variable approach instead.
-    ;; For now, rely on session running? flag.
-    #t)
-
-  (define (thread-yield)
-    ;; Yield to other threads
-    (sleep (make-time 'time-duration 1000000 0)))  ;; 1ms
+  ;; Wait for a session's background thread to finish using its condition variable.
+  (define (scheme-thread-join-session session)
+    (let ([mtx (fuse-session-mutex session)]
+          [cv  (fuse-session-done session)])
+      (when cv
+        (with-mutex mtx
+          (let loop ()
+            (when (fuse-session-running? session)
+              (condition-wait cv mtx)
+              (loop)))))))
 
   (define (create-session ops mountpoint options)
     (let* ([fsname (get-option options 'fsname "chez-fuse")]
            [debug? (get-option options 'debug #f)]
            [allow-other? (get-option options 'allow-other #t)]
            [fd (fuse-open-device)]
+           [mtx (make-mutex)]
            [session (make-fuse-session
                       fd mountpoint #f #f
                       FUSE-KERNEL-VERSION FUSE-KERNEL-MINOR-VERSION
                       131072 131072  ;; max-write, max-readahead
                       ops
-                      (make-mutex)   ;; dispatch mutex
+                      mtx            ;; dispatch mutex
                       #f             ;; thread handle
-                      #f)]           ;; done condition
+                      (make-condition))]  ;; done condition
            [uid (getuid)]
            [gid (getgid)])
       (fuse-mount! fd mountpoint fsname uid gid allow-other?)
@@ -228,7 +225,11 @@
         ;; Then explicitly unmount (belt and suspenders)
         (guard (exn [else (void)])
           (fuse-unmount! mountpoint))
-        (fuse-session-mounted?-set! session #f))))
+        (fuse-session-mounted?-set! session #f))
+      ;; Signal waiters that the session is done
+      (fuse-session-running?-set! session #f)
+      (let ([cv (fuse-session-done session)])
+        (when cv (condition-broadcast cv)))))
 
   ;; Install SIGINT handler to cleanly stop the session.
   (define (install-interrupt-handler session)

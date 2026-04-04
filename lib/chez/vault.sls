@@ -563,6 +563,7 @@
             (let ([sb-num-bv (vault-decrypt-small pk sb-enc)])
               (unless sb-num-bv
                 (bytevector-fill! pk 0)
+                (bytevector-fill! master-key 0)
                 (error 'vault-open "corrupt vault (superblock locator)"))
               ;; Set master key in blockstore
               (blockstore-set-key! bs master-key)

@@ -70,7 +70,7 @@
     ;; Helpers
     fuse-rec-align)
 
-  (import (rnrs))
+  (import (rnrs) (only (chezscheme) machine-type))
 
   ;; ---- Protocol version ----
   (define FUSE-KERNEL-VERSION 7)
@@ -213,14 +213,22 @@
   (define DT-SOCK    12)
   (define DT-WHT     14)
 
+  ;; ---- Platform detection (used for divergent constants below) ----
+  (define freebsd?
+    (case (machine-type)
+      [(a6fb ta6fb i3fb ti3fb arm64fb tarm64fb) #t]
+      [else #f]))
+
   ;; ---- Open flags ----
+  ;; O_RDONLY, O_WRONLY, O_RDWR are the same everywhere.
+  ;; O_CREAT, O_EXCL, O_TRUNC, O_APPEND differ between Linux and FreeBSD.
   (define O-RDONLY   #x0000)
   (define O-WRONLY   #x0001)
   (define O-RDWR     #x0002)
-  (define O-CREAT    #x0040)
-  (define O-EXCL     #x0080)
-  (define O-TRUNC    #x0200)
-  (define O-APPEND   #x0400)
+  (define O-CREAT    (if freebsd? #x0200 #x0040))
+  (define O-EXCL     (if freebsd? #x0800 #x0080))
+  (define O-TRUNC    (if freebsd? #x0400 #x0200))
+  (define O-APPEND   (if freebsd? #x0008 #x0400))
 
   ;; ---- Access flags ----
   (define F-OK 0)
@@ -229,7 +237,8 @@
   (define X-OK 1)
 
   ;; ---- Errno values ----
-  ;; POSIX values — same on Linux and FreeBSD for the common set
+  ;; Values 1-34 are the same on Linux and FreeBSD.
+  ;; Higher values diverge — use platform detection.
   (define EPERM           1)
   (define ENOENT          2)
   (define ESRCH           3)
@@ -262,15 +271,17 @@
   (define EPIPE          32)
   (define EDOM           33)
   (define ERANGE         34)
-  (define ENOSYS         38)
-  (define ENOTEMPTY      39)
-  (define ENAMETOOLONG   36)
-  (define ELOOP          40)
-  (define ENODATA        61)
-  (define ENOTCONN      107)
-  (define EOVERFLOW      75)
-  (define EOPNOTSUPP     95)
-  (define ENOTSUP        95)
+
+  ;; Platform-divergent errno values
+  (define ENAMETOOLONG  (if freebsd? 63  36))
+  (define ENOSYS        (if freebsd? 78  38))
+  (define ENOTEMPTY     (if freebsd? 66  39))
+  (define ELOOP         (if freebsd? 62  40))
+  (define ENODATA       (if freebsd? 89  61))   ;; FreeBSD: ENOATTR=89
+  (define ENOTCONN      (if freebsd? 57 107))
+  (define EOVERFLOW     (if freebsd? 84  75))
+  (define EOPNOTSUPP    (if freebsd? 45  95))
+  (define ENOTSUP       EOPNOTSUPP)
 
   ;; ---- Helpers ----
   ;; 8-byte alignment for FUSE records
