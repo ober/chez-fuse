@@ -208,7 +208,7 @@ int chez_fuse_mount(int fd, const char *mountpoint, const char *fsname,
     snprintf(fd_str, sizeof(fd_str), "%d", fd);
 
     /* Build iovec dynamically based on options */
-    struct iovec iov[12];
+    struct iovec iov[14];
     int niov = 0;
 
 #define IOV_SET(key, val) do { \
@@ -222,7 +222,10 @@ int chez_fuse_mount(int fd, const char *mountpoint, const char *fsname,
 
     IOV_SET("fstype", "fusefs");
     IOV_SET("fspath", mountpoint);
-    IOV_SET("from", fsname);
+    /* FreeBSD fusefs requires "from" to be the /dev/fuse device path.
+     * The user-visible label (fsname) is passed as "subtype". */
+    IOV_SET("from", "/dev/fuse");
+    IOV_SET("subtype", fsname);
     IOV_SET("fd", fd_str);
 
     if (allow_other) {
